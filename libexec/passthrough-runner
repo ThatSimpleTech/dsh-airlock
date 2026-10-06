@@ -1,0 +1,22 @@
+#!/bin/bash
+# dsh-airlock command runner.
+#
+# dsh-airlock runs the whole dsh process inside a sandbox-exec profile. macOS
+# refuses to nest sandboxes, so dsh's own per-command sandbox-exec call would
+# fail and every bash tool call would be refused. dsh calls this script instead
+# (sandbox.runnerCommand), passing bwrap-style profile arguments, then "--",
+# then the real command. The outer airlock profile already confines every child
+# process, so this drops the profile arguments and runs the command as-is.
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+  shift
+done
+if [ "$#" -eq 0 ]; then
+  echo "dsh-airlock-runner: no -- separator in arguments" >&2
+  exit 125
+fi
+shift
+if [ "$#" -eq 0 ]; then
+  echo "dsh-airlock-runner: no command after --" >&2
+  exit 125
+fi
+exec "$@"

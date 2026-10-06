@@ -1,0 +1,8 @@
+{
+  "name": "dsh-airlock-upstream",
+  "private": true,
+  "description": "Pinned DSH (DeepSeek Harness) release that dsh-airlock installs. Upgrade = bump the version, npm install --package-lock-only --ignore-scripts, re-review (docs/REVIEW.md), rerun the proof.",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.0-rc.2"
+  }
+}

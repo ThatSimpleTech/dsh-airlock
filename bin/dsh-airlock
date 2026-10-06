@@ -1,0 +1,308 @@
+#!/bin/bash
+# dsh-airlock: run DSH (DeepSeek Harness) on macOS inside a kernel sandbox, with
+# every DeepSeek-facing plugin unmounted and a Brave/SearXNG web search instead.
+#
+#   dsh-airlock                    start the web UI (settings and keys read-only)
+#   dsh-airlock --setup            start the web UI with settings writable (add model keys)
+#   dsh-airlock --search brave     use Brave Search (default; needs BRAVE_SEARCH_API_KEY)
+#   dsh-airlock --search searxng URL   use a SearXNG server instead
+#   dsh-airlock --search off       no web search (web fetch still works)
+#   dsh-airlock --set-key NAME     store a secret such as BRAVE_SEARCH_API_KEY (prompts)
+#   dsh-airlock --selftest         run probe commands inside the box and report
+#   dsh-airlock --check            print the sandbox profile and composed dsh config
+#   dsh-airlock --run ARGS...      run `dsh ARGS...` inside the box (e.g. headless "task")
+#   dsh-airlock --version
+#
+# Environment: DSH_WORKSPACE (default ~/Documents/dsh-workspace), DSH_PORT (3080),
+# DSH_AIRLOCK_HOME (the sandbox's fake home, default ~/.dsh-airlock),
+# DSH_AIRLOCK_ROOT (install, default ~/.local/share/dsh-airlock), DSH_AIRLOCK_NODE,
+# DSH_AIRLOCK_NO_BROWSER=1 (print the URL instead of opening it).
+# Test hooks, used by test/prove.sh: DSH_AIRLOCK_SANDBOX_EXTRA (SBPL rules appended
+# to the profile) and DSH_AIRLOCK_PASS_ENV (names of variables passed into the box).
+#
+# What the box enforces, in the kernel, for dsh and every command it runs:
+#   - HOME is the fake home. The real home folder is unreadable except the
+#     workspace, the fake home, the dsh-airlock install and a Node runtime that
+#     lives under home. /private/tmp, the user temp folder and /Volumes too.
+#   - Writes only to the workspace, the fake home and /dev.
+#   - No app launching (open, LaunchServices), AppleScript, keychain tool,
+#     screen capture, clipboard, or reading other apps' preferences.
+#   - In a normal run, dsh's own settings, keys, .env files and skills folders
+#     are write-protected so the agent cannot change its own configuration.
+# Network stays open: dsh needs it to reach the model API.
+set -euo pipefail
+
+AIRLOCK_VERSION="0.1.0"
+ROOT="${DSH_AIRLOCK_ROOT:-$HOME/.local/share/dsh-airlock}"
+BOX_HOME="${DSH_AIRLOCK_HOME:-$HOME/.dsh-airlock}"
+WORKSPACE="${DSH_WORKSPACE:-$HOME/Documents/dsh-workspace}"
+PORT="${DSH_PORT:-3080}"
+RUNNER="$ROOT/libexec/passthrough-runner"
+SELFTEST="$ROOT/libexec/selftest.sh"
+SEARCH_PLUGIN="dsh-airlock-web-search"
+
+die() { echo "dsh-airlock: $*" >&2; exit 1; }
+
+mode="locked"
+run_args=()
+case "${1:-}" in
+  "") ;;
+  --setup) mode="setup" ;;
+  --check) mode="check" ;;
+  --selftest) mode="selftest" ;;
+  --run) mode="run"; shift; run_args=("$@"); [ "${#run_args[@]}" -gt 0 ] || die "--run needs dsh arguments" ;;
+  --set-key) mode="set-key"; [ "$#" -eq 2 ] || die "usage: dsh-airlock --set-key NAME" ;;
+  --search) mode="search"; [ "$#" -ge 2 ] || die "usage: dsh-airlock --search brave|searxng URL|off" ;;
+  --version) echo "dsh-airlock $AIRLOCK_VERSION"; exit 0 ;;
+  -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) die "unknown option: $1 (see --help)" ;;
+esac
+
+[ "$(uname -s)" = "Darwin" ] || die "dsh-airlock needs macOS (sandbox-exec)"
+[ -x /usr/bin/sandbox-exec ] || die "/usr/bin/sandbox-exec not found"
+
+real() { (cd "$1" && pwd -P); }
+mkdir -p "$BOX_HOME/.dsh" "$BOX_HOME/tmp"
+chmod 700 "$BOX_HOME" "$BOX_HOME/.dsh"
+R_BOX="$(real "$BOX_HOME")"
+CONF="$R_BOX/airlock.conf"
+
+conf_get() { [ -f "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | tail -1 || true; }
+conf_set() {
+  local tmp="$CONF.tmp"
+  { [ -f "$CONF" ] && grep -v "^$1=" "$CONF" || true; printf '%s=%s\n' "$1" "$2"; } > "$tmp"
+  mv "$tmp" "$CONF"
+}
+valid_url() { local pattern='^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'; [[ "$1" =~ $pattern ]]; }
+
+# Commands that only edit airlock state, outside the sandbox.
+if [ "$mode" = "search" ]; then
+  case "$2" in
+    brave) [ "$#" -eq 2 ] || die "usage: dsh-airlock --search brave"; conf_set SEARCH_BACKEND brave ;;
+    off) [ "$#" -eq 2 ] || die "usage: dsh-airlock --search off"; conf_set SEARCH_BACKEND off ;;
+    searxng)
+      [ "$#" -eq 3 ] || die "usage: dsh-airlock --search searxng URL"
+      valid_url "$3" || die "not a plain http(s) URL: $3"
+      conf_set SEARXNG_URL "$3"; conf_set SEARCH_BACKEND searxng ;;
+    *) die "unknown search backend: $2 (brave, searxng or off)" ;;
+  esac
+  echo "dsh-airlock: web search set to $2. Restart dsh-airlock for it to take effect."
+  exit 0
+fi
+if [ "$mode" = "set-key" ]; then
+  name="$2"
+  [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "key name must look like BRAVE_SEARCH_API_KEY"
+  case "$name" in DSH_*|XDG_*|PATH|HOME|NODE_*) die "refusing to set $name" ;; esac
+  if [ -t 0 ]; then read -r -s -p "Value for $name (input hidden): " value; echo; else IFS= read -r value || true; fi
+  [ -n "${value:-}" ] || die "empty value, nothing stored"
+  [[ "$value" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] || die "value has characters this helper does not store; use Settings > Models instead"
+  envfile="$R_BOX/.dsh/.env"
+  ( umask 077
+    { [ -f "$envfile" ] && grep -v "^$name=" "$envfile" || true; printf '%s=%s\n' "$name" "$value"; } > "$envfile.tmp"
+    mv "$envfile.tmp" "$envfile" )
+  chmod 600 "$envfile"
+  echo "dsh-airlock: stored $name in $envfile. The agent can read this file inside the box; use a key you can revoke."
+  exit 0
+fi
+
+UPSTREAM="$ROOT/upstream/current"
+DSH_BIN="$UPSTREAM/node_modules/@deepseek-ai/dsh/lib/bin.js"
+[ -f "$DSH_BIN" ] || die "DSH is not installed under $ROOT; run install.sh from the dsh-airlock repo"
+[ -x "$RUNNER" ] || die "runner missing or not executable: $RUNNER"
+[ -d "$UPSTREAM/node_modules/$SEARCH_PLUGIN" ] || die "search plugin missing; rerun install.sh"
+NODE="${DSH_AIRLOCK_NODE:-$(command -v node || true)}"
+[ -n "$NODE" ] && [ -x "$NODE" ] || die "node not found; set DSH_AIRLOCK_NODE"
+
+mkdir -p "$WORKSPACE"
+R_HOME="$(real "$HOME")"
+R_WS="$(real "$WORKSPACE")"
+R_ROOT="$(real "$ROOT")"
+R_NODE_BIN="$(cd "$(dirname "$NODE")" && pwd -P)/$(basename "$NODE")"
+R_NODE_BIN="$(readlink -f "$R_NODE_BIN" 2>/dev/null || echo "$R_NODE_BIN")"
+R_NODE_PREFIX="$(dirname "$(dirname "$R_NODE_BIN")")"
+R_USER_TMP="$(real "$(getconf DARWIN_USER_TEMP_DIR)")"
+
+for p in "$R_HOME" "$R_WS" "$R_ROOT" "$R_BOX" "$R_NODE_PREFIX"; do
+  case "$p" in *[\"\'\\]*) die "paths with quotes or backslashes are not supported: $p" ;; esac
+done
+case "$R_WS/" in
+  "$R_HOME/"|"/"|"$R_BOX/"*|"$R_ROOT/"*) die "workspace must be a dedicated folder, not $R_WS" ;;
+esac
+case "$R_HOME/" in "$R_WS/"*) die "workspace $R_WS contains the home folder" ;; esac
+case "$R_BOX/" in "$R_WS/"*) die "the sandbox home must not be inside the workspace" ;; esac
+
+if [ "$mode" = "selftest" ] && [ ! -f "$R_BOX/.dsh/.credentials.yaml" ]; then
+  die "run dsh-airlock --setup once before --selftest"
+fi
+if { [ "$mode" = "locked" ] || [ "$mode" = "run" ]; } && [ ! -f "$R_BOX/.dsh/.credentials.yaml" ]; then
+  echo "dsh-airlock: first run, using setup mode so dsh can create its key file." >&2
+  mode_rules="setup"
+else
+  mode_rules="$mode"
+fi
+if [ "$mode_rules" = "run" ]; then
+  mode_rules="locked"
+  # dsh creates a profile's folder on its first use, which locked rules forbid.
+  profile_name="${run_args[0]}"
+  [ "$profile_name" = "--profile" ] && profile_name="${run_args[1]:-}"
+  case "$profile_name" in
+    -*|"") ;;
+    *) if [ ! -d "$R_BOX/.dsh/profiles/$profile_name" ]; then
+         echo "dsh-airlock: first use of profile $profile_name, using setup mode so dsh can create it." >&2
+         mode_rules="setup"
+       fi ;;
+  esac
+fi
+
+[ -f "$R_BOX/.gitconfig" ] || printf '[user]\n\tname = dsh agent\n\temail = dsh-agent@localhost\n[init]\n\tdefaultBranch = main\n' > "$R_BOX/.gitconfig"
+
+backend="$(conf_get SEARCH_BACKEND)"; backend="${backend:-brave}"
+searxng_url="$(conf_get SEARXNG_URL)"
+brave_base="$(conf_get BRAVE_BASE_URL)"
+for u in "$searxng_url" "$brave_base"; do [ -z "$u" ] || valid_url "$u" || die "bad URL in $CONF: $u"; done
+case "$backend" in brave|searxng|off) ;; *) die "bad SEARCH_BACKEND in $CONF: $backend" ;; esac
+
+# The launcher-owned top patch layer. It ranks above the profile patch the web
+# UI writes, so these rows win over anything saved in Settings.
+{
+cat <<YAML
+# Written by dsh-airlock on every start. Change the launcher, not this file.
+# Every DeepSeek-facing plugin is unmounted: the official DeepSeek model route
+# and its request add-ons (session-log upload, plugin inventory), the DeepSeek
+# account login, DeepSeek web search, and the like/dislike/feedback pieces that
+# upload session logs to DeepSeek's telemetry collector.
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- id: deepseek-llm-api-extensions
+  disabled: true
+- id: llm-deepseek
+  disabled: true
+- id: llm-deepseek-account
+  disabled: true
+- id: deepseek-account
+  disabled: true
+- id: account-controller
+  disabled: true
+- id: ui-settings-account
+  disabled: true
+- id: session-telemetry-otel
+  disabled: true
+- id: message-feedback
+  disabled: true
+- id: ui-message-feedback
+  disabled: true
+- id: command-feedback
+  disabled: true
+- id: web-search-deepseek
+  disabled: true
+# macOS refuses nested sandboxes, so dsh's own per-command sandbox-exec is
+# replaced by a pass-through; the outer airlock box confines every command.
+- id: sandbox
+  config:
+    runnerCommand: ['$RUNNER']
+    runnerFailureSignatures: ['dsh-airlock-runner:']
+# The sidebar terminal runs outside dsh's approvals; the LibreOffice converter
+# opens untrusted documents with network code. Both off.
+- id: terminal-controller
+  disabled: true
+- id: ui-sidebar-terminal
+  disabled: true
+- id: office-to-pdf
+  disabled: true
+# dsh asks AppleScript for ~/Documents, which the box blocks; point it here.
+- id: workspace-controller
+  config:
+    documentsDirectory: '$R_WS'
+- id: web
+  config:
+    searchProvider: airlock-search
+    fetchProvider: http
+YAML
+if [ "$backend" != "off" ]; then
+  echo "- insert:"
+  echo "    - id: web-search-airlock"
+  echo "      name: '$SEARCH_PLUGIN'"
+  echo "      config:"
+  echo "        backend: $backend"
+  [ -z "$searxng_url" ] || echo "        searxngURL: '$searxng_url'"
+  [ -z "$brave_base" ] || echo "        braveBaseURL: '$brave_base'"
+fi
+} > "$R_BOX/.dsh/cordis.patch.yml"
+
+q() { printf '"%s"' "$1"; }
+re() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'; }
+node_read=""
+case "$R_NODE_PREFIX/" in "$R_HOME/"*) node_read="(subpath $(q "$R_NODE_PREFIX"))" ;; esac
+PROFILE="(version 1)
+(allow default)
+(deny file-read-data (subpath $(q "$R_HOME")) (subpath \"/private/tmp\") (subpath $(q "$R_USER_TMP")) (subpath \"/Volumes\"))
+(allow file-read-data (subpath $(q "$R_WS")) (subpath $(q "$R_BOX")) (subpath $(q "$R_ROOT")) $node_read)
+(deny file-write*)
+(allow file-write* (subpath $(q "$R_WS")) (subpath $(q "$R_BOX")) (subpath \"/dev\"))
+(deny file-write* (literal $(q "$R_WS")) (literal $(q "$R_BOX")) (literal $(q "$R_BOX/.dsh")) (literal $(q "$R_BOX/.dsh/cordis.patch.yml")) (literal $(q "$CONF")) (literal $(q "$R_WS/.env")))
+(deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/usr/bin/security\") (literal \"/usr/bin/shortcuts\") (literal \"/usr/bin/automator\") (literal \"/usr/sbin/screencapture\"))
+(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name-prefix \"com.apple.lsd.\") (global-name-prefix \"com.apple.pasteboard\") (global-name \"com.apple.SecurityServer\") (global-name \"com.apple.securityd.xpc\") (global-name \"com.apple.cfprefsd.agent\"))"
+if [ "$mode_rules" = "locked" ] || [ "$mode_rules" = "selftest" ]; then
+  D="$R_BOX/.dsh"
+  PROFILE="$PROFILE
+(deny file-write* (literal $(q "$D/.credentials.yaml")) (literal $(q "$D/.env")) (literal $(q "$D/settings.yaml")) (literal $(q "$D/AGENTS.md")) (literal $(q "$D/profiles")) (regex #\"^$(re "$D/profiles")/[^/]+(/cordis\\.patch\\.yml|/package\\.json)?\$\") (subpath $(q "$D/skills")) (subpath $(q "$R_BOX/.agents")) (literal $(q "$R_WS/.dsh")) (subpath $(q "$R_WS/.dsh/skills")))"
+fi
+if [ -n "${DSH_AIRLOCK_SANDBOX_EXTRA:-}" ]; then
+  PROFILE="$PROFILE
+$DSH_AIRLOCK_SANDBOX_EXTRA"
+fi
+
+path_dirs="$(dirname "$R_NODE_BIN")"
+for d in /opt/homebrew/bin /usr/local/bin; do [ -d "$d" ] && path_dirs="$path_dirs:$d"; done
+ENV=(
+  HOME="$R_BOX"
+  USER="$(id -un)"
+  LOGNAME="$(id -un)"
+  SHELL=/bin/bash
+  PATH="$path_dirs:/usr/bin:/bin:/usr/sbin:/sbin"
+  TMPDIR="$R_BOX/tmp"
+  LANG="${LANG:-en_US.UTF-8}"
+  TERM="${TERM:-xterm-256color}"
+  DSH_TELEMETRY_DISABLED=1
+  # If any DeepSeek endpoint is ever reached for anyway, point it at the local
+  # discard port so the request dies on this Mac.
+  DSH_TELEMETRY_OTLP_URL=http://127.0.0.1:9/v1/logs
+  DSH_PRODUCT_ANALYTICS_OTLP_URL=http://127.0.0.1:9/v1/logs
+  DEEPSEEK_BASE_URL=http://127.0.0.1:9
+  DEEPSEEK_SEARCH_BASE_URL=http://127.0.0.1:9
+  NO_UPDATE_NOTIFIER=1
+)
+for name in ${DSH_AIRLOCK_PASS_ENV:-}; do
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "bad name in DSH_AIRLOCK_PASS_ENV: $name"
+  [ -n "${!name+x}" ] && ENV+=("$name=${!name}")
+done
+
+box() { env -i "${ENV[@]}" /usr/bin/sandbox-exec -p "$PROFILE" "$@"; }
+
+cd "$R_WS"
+case "$mode" in
+  check)
+    echo "$PROFILE"; echo "---"
+    box "$NODE" "$DSH_BIN" web --dump-config ;;
+  selftest)
+    box /bin/bash "$SELFTEST" "$R_HOME" "$R_WS" "$R_BOX" ;;
+  run)
+    box "$NODE" "$DSH_BIN" "${run_args[@]}" ;;
+  setup|locked)
+    echo "dsh-airlock: ${mode_rules} mode, workspace $R_WS, web search: $backend"
+    [ "$mode_rules" = "setup" ] && echo "dsh-airlock: setup mode: add a model key under Settings > Models and pick the model, then Ctrl+C and run dsh-airlock again."
+    opened=""
+    box "$NODE" "$DSH_BIN" web --no-open --port "$PORT" 2>&1 |
+    while IFS= read -r line; do
+      printf '%s\n' "$line"
+      if [ -z "$opened" ]; then
+        url="$(printf '%s\n' "$line" | grep -o -E "https?://(127\.0\.0\.1|localhost):$PORT/[^[:space:]]*" | head -1 || true)"
+        if [ -n "$url" ]; then
+          opened=1
+          [ -n "${DSH_AIRLOCK_NO_BROWSER:-}" ] || /usr/bin/open "$url"
+        fi
+      fi
+    done ;;
+esac

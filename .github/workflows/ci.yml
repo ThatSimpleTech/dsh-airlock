@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    # The sandbox itself needs macOS and is proven locally with test/prove.sh and
+    # dsh-airlock --selftest. CI covers what runs anywhere, on one cheap runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Search plugin unit tests
+        working-directory: plugins/web-search
+        run: npm test
+      - name: Script syntax
+        run: |
+          for f in install.sh uninstall.sh test/prove.sh bin/dsh-airlock libexec/passthrough-runner libexec/selftest.sh; do
+            bash -n "$f"
+          done
+          node --check plugins/web-search/index.js
+          node --check test/prove/mock-servers.mjs
+          node --check test/prove/netlog-hook.mjs
+      - name: Lockfile matches the pinned version
+        run: |
+          node -e '
+            const pkg = require("./upstream/package.json");
+            const lock = require("./upstream/package-lock.json");
+            const want = pkg.dependencies["@deepseek-ai/dsh"];
+            const got = lock.packages["node_modules/@deepseek-ai/dsh"].version;
+            if (want !== got || lock.packages[""].dependencies["@deepseek-ai/dsh"] !== want) {
+              console.error(`pinned ${want}, lockfile has ${got}`); process.exit(1);
+            }
+            console.log("pinned", want);
+          '
