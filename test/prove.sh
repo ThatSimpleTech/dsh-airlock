@@ -2,7 +2,7 @@
 # Proof run: real dsh agent turns inside the airlock, with
 #   - the network locked to this Mac (an extra sandbox rule),
 #   - a fake model that makes the agent run a shell probe and a web search,
-#   - a fake Brave Search API (checks the key stored with --set-key),
+#   - fake Brave and Tavily search APIs (check the keys stored with --set-key),
 #   - every DeepSeek endpoint pointed at a trap,
 #   - a hook inside dsh recording every connection and DNS lookup it makes.
 # Uses a throwaway sandbox home and workspace; your real ones are not touched.
@@ -39,11 +39,13 @@ MOCK_PID=$!
 for _ in $(seq 1 50); do [ -s "$T/ports.json" ] && break; sleep 0.1; done
 [ -s "$T/ports.json" ] || { cat "$T/mock.out"; echo "prove: mock servers did not start" >&2; exit 2; }
 port() { "$NODE" -p "require('$T/ports.json').$1"; }
-MODEL_PORT="$(port model)"; BRAVE_PORT="$(port brave)"; TRAP_PORT="$(port trap)"
+MODEL_PORT="$(port model)"; BRAVE_PORT="$(port brave)"; TAVILY_PORT="$(port tavily)"; TRAP_PORT="$(port trap)"
 
 "$AIRLOCK" --search brave >/dev/null
 printf 'BRAVE_BASE_URL=http://127.0.0.1:%s/res/v1\n' "$BRAVE_PORT" >> "$DSH_AIRLOCK_HOME/airlock.conf"
 printf 'prove-brave-key' | "$AIRLOCK" --set-key BRAVE_SEARCH_API_KEY >/dev/null
+printf 'TAVILY_BASE_URL=http://127.0.0.1:%s\n' "$TAVILY_PORT" >> "$DSH_AIRLOCK_HOME/airlock.conf"
+printf 'prove-tavily-key' | "$AIRLOCK" --set-key TAVILY_API_KEY >/dev/null
 
 cat > "$DSH_AIRLOCK_HOME/mock-provider.yml" <<YAML
 - id: llm-pi-ai
@@ -90,16 +92,19 @@ echo "prove: web UI started and stopped (setup run)"
 
 "$AIRLOCK" --run headless --dump-config > /dev/null 2>&1 || true  # first use of the headless profile (setup rules)
 for turn in 1 2; do
-  echo "prove: agent turn $turn (locked mode)"
+  # Turn 1 searches through Brave, turn 2 through Tavily.
+  [ "$turn" = 1 ] && search=brave || search=tavily
+  "$AIRLOCK" --search "$search" >/dev/null
+  echo "prove: agent turn $turn (locked mode, $search search)"
   if ! perl -e 'alarm shift; exec @ARGV' 180 "$AIRLOCK" --run headless --patch "$DSH_AIRLOCK_HOME/mock-provider.yml" "Run the airlock probe." > "$T/turn$turn.out" 2>&1; then
     cat "$T/turn$turn.out"; echo "prove: FAIL dsh headless turn $turn exited non-zero" >&2; exit 1
   fi
 done
 unset NODE_OPTIONS
 
-"$NODE" - "$T" "$MODEL_PORT" "$BRAVE_PORT" <<'JS'
+"$NODE" - "$T" "$MODEL_PORT" "$BRAVE_PORT" "$TAVILY_PORT" <<'JS'
 const fs = require("fs");
-const [dir, modelPort, bravePort] = process.argv.slice(2);
+const [dir, modelPort, bravePort, tavilyPort] = process.argv.slice(2);
 const lines = (f) => (fs.existsSync(`${dir}/${f}`) ? fs.readFileSync(`${dir}/${f}`, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []);
 let failed = 0;
 const check = (ok, label, detail = "") => { console.log(`${ok ? "ok  " : "FAIL"}  ${label}${detail ? "  (" + detail + ")" : ""}`); if (!ok) failed++; };
@@ -111,10 +116,13 @@ for (const turn of [1, 2]) {
   check(out.includes("CANARY_BLOCKED") && !out.includes("CANARY_READABLE"), `turn ${turn}: file in the real home folder unreadable`);
   check(out.includes("OPEN_BLOCKED"), `turn ${turn}: launching apps blocked`);
   check(out.includes("EXTERNAL_BLOCKED"), `turn ${turn}: proof network lock active (harness sanity)`);
-  check(out.includes("Airlock mock result"), `turn ${turn}: web search answered through the dsh-airlock plugin`);
+  const want = turn === 1 ? ["Airlock mock result", "Brave"] : ["Tavily mock result", "Tavily"];
+  check(out.includes(want[0]), `turn ${turn}: web search answered through the dsh-airlock plugin (${want[1]})`);
 }
 const brave = lines("brave.jsonl");
-check(brave.length >= 2 && brave.every((r) => r.tokenOk), "Brave key from --set-key reached the search API", `${brave.length} request(s)`);
+check(brave.length >= 1 && brave.every((r) => r.tokenOk), "Brave key from --set-key reached the Brave API", `${brave.length} request(s)`);
+const tavily = lines("tavily.jsonl");
+check(tavily.length >= 1 && tavily.every((r) => r.tokenOk && r.method === "POST"), "Tavily key from --set-key reached the Tavily API", `${tavily.length} request(s)`);
 const trap = lines("trap.jsonl");
 check(trap.length === 0, "no request reached any DeepSeek endpoint", trap.length ? JSON.stringify(trap[0]) : "");
 const model = lines("model.jsonl");
@@ -122,7 +130,7 @@ const extra = [...new Set(model.flatMap((m) => m.keys).filter((k) => /^dsh_|sess
 check(model.length > 0 && extra.length === 0, "model requests carry no DeepSeek add-on fields", extra.join(",") || `${model.length} request(s)`);
 const net = lines("home/netlog.jsonl");
 check(net.some((n) => n.kind === "hook-loaded"), "connection recorder loaded in dsh");
-const allowed = new Set([`127.0.0.1:${modelPort}`, `127.0.0.1:${bravePort}`, `localhost:${modelPort}`, `localhost:${bravePort}`]);
+const allowed = new Set([modelPort, bravePort, tavilyPort].flatMap((p) => [`127.0.0.1:${p}`, `localhost:${p}`]));
 const outbound = net.filter((n) => n.kind === "connect" && !allowed.has(n.target) && !n.target.startsWith("/"));
 check(outbound.length === 0, "dsh connected only to the local fakes", outbound.map((n) => n.target).join(", ") || `${net.filter((n) => n.kind === "connect").length} connect(s)`);
 const dns = net.filter((n) => n.kind === "dns" && !["127.0.0.1", "localhost", "::1"].includes(n.target));

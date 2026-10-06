@@ -1,7 +1,8 @@
 // Local stand-ins for the proof run, all on 127.0.0.1 with OS-assigned ports:
 //   model - an OpenAI-compatible chat endpoint that drives the agent through a
 //           shell probe, then a web search, then a final answer.
-//   brave - a fake Brave Search API that checks the subscription token.
+//   brave  - a fake Brave Search API that checks the subscription token.
+//   tavily - a fake Tavily Search API that checks the bearer key.
 //   trap  - where every DeepSeek endpoint is pointed; any hit is a failure.
 // Usage: node mock-servers.mjs <outdir> <canary-path>. Writes <outdir>/ports.json
 // and one JSONL log per server.
@@ -75,6 +76,18 @@ const brave = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ web: { results: [{ url: "https://example.com/airlock", title: "<strong>Airlock</strong> mock result", description: "served by the fake Brave API" }] } }));
 });
 
+const tavily = http.createServer(async (req, res) => {
+  const raw = await readBody(req);
+  let body = {};
+  try { body = JSON.parse(raw); } catch {}
+  const url = new URL(req.url, "http://localhost");
+  const tokenOk = req.headers.authorization === "Bearer prove-tavily-key";
+  log("tavily", { method: req.method, path: url.pathname, query: body.query, max_results: body.max_results, tokenOk });
+  if (!tokenOk || req.method !== "POST") { res.writeHead(401); return res.end("{}"); }
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ query: body.query, results: [{ url: "https://example.net/tavily", title: "Tavily mock result", content: "served by the fake Tavily API", score: 0.9 }], response_time: 0.1 }));
+});
+
 const trap = http.createServer(async (req, res) => {
   const raw = await readBody(req);
   log("trap", { method: req.method, url: req.url, host: req.headers.host, bytes: raw.length });
@@ -83,6 +96,6 @@ const trap = http.createServer(async (req, res) => {
 });
 
 const listen = (server) => new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
-const ports = { model: await listen(model), brave: await listen(brave), trap: await listen(trap) };
+const ports = { model: await listen(model), brave: await listen(brave), tavily: await listen(tavily), trap: await listen(trap) };
 fs.writeFileSync(path.join(outDir, "ports.json"), JSON.stringify(ports));
 console.log("mock servers", ports);

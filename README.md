@@ -21,7 +21,7 @@ dsh-airlock is a launcher, a web search plugin and a pinned install. It does not
   - No launching apps, no AppleScript, no keychain tool, no screen capture, no clipboard, and no reading other apps' preferences.
   - In normal runs dsh's own settings, stored keys, `.env` files and skills folders are read-only, so the agent can't rewrite its own configuration.
 - Unmounts every DeepSeek-facing plugin: the official DeepSeek model route and its request add-ons (session-log upload, plugin inventory), DeepSeek account login, DeepSeek web search, and the like/dislike/feedback pieces that feed the telemetry upload. The DeepSeek endpoints are also pointed at a local discard port as a backstop.
-- Swaps in its own web search: the [Brave Search API](https://brave.com/search/api/) or any [SearXNG](https://docs.searxng.org/) server you point it at. Web fetch keeps working as before.
+- Swaps in its own web search: the [Brave Search API](https://brave.com/search/api/), the [Tavily API](https://tavily.com/), or any [SearXNG](https://docs.searxng.org/) server you point it at. Web fetch keeps working as before.
 - Installs a pinned DSH release with `npm ci --ignore-scripts` from a committed lockfile, so you get exact versions with integrity hashes and no install scripts run.
 - Ships a self-test and a network proof so you don't have to take any of this on faith.
 
@@ -53,15 +53,22 @@ That puts the launcher in `~/.local/bin/dsh-airlock` (make sure that's on your P
    ```
    Your browser opens the dsh web UI. Go to Settings > Models > Add model provider and pick Anthropic, OpenAI, another listed provider, or Custom model API for a gateway or a local server (Ollama, vLLM, LiteLLM). Then pick that model in the model picker so it's saved as the default, and press Ctrl+C. The official DeepSeek provider is gone. You can still run DeepSeek's open-weight models through any other host or your own server.
 
-2. Set up web search. Brave is the default and needs a key (they have a free tier):
-   ```bash
-   dsh-airlock --set-key BRAVE_SEARCH_API_KEY
-   ```
-   Or use a SearXNG server instead. It has to allow JSON output (`json` under `search.formats` in its `settings.yml`):
-   ```bash
-   dsh-airlock --search searxng https://search.example.org
-   ```
-   Or turn search off with `dsh-airlock --search off`.
+2. Set up web search. There are three options and each one is a key or a URL:
+   - **Brave Search** is the default. It runs its own index and has a free tier:
+     ```bash
+     dsh-airlock --set-key BRAVE_SEARCH_API_KEY
+     ```
+   - **Tavily** is built for agents and has free monthly credits. Some company networks block Brave outright, and Tavily is the one to use there:
+     ```bash
+     dsh-airlock --search tavily
+     dsh-airlock --set-key TAVILY_API_KEY
+     ```
+   - **SearXNG** is a search engine you host yourself, no key. The server has to allow JSON output (`json` under `search.formats` in its `settings.yml`):
+     ```bash
+     dsh-airlock --search searxng https://search.example.org
+     ```
+
+   Or turn search off with `dsh-airlock --search off`. If the search service can't be reached, the agent gets an error that names the host and tells you how to switch.
 
 3. Check the box holds:
    ```bash
@@ -82,6 +89,7 @@ The agent works in `~/Documents/dsh-workspace`. Put files there for it to work o
 | `dsh-airlock` | Start the web UI. Settings and keys are read-only. |
 | `dsh-airlock --setup` | Start the web UI with settings writable, to add or change model keys. |
 | `dsh-airlock --search brave` | Use Brave Search (default). |
+| `dsh-airlock --search tavily` | Use Tavily. |
 | `dsh-airlock --search searxng URL` | Use a SearXNG server. |
 | `dsh-airlock --search off` | No web search. |
 | `dsh-airlock --set-key NAME` | Store a secret such as `BRAVE_SEARCH_API_KEY`. Prompts with input hidden. |
@@ -108,7 +116,7 @@ Environment overrides: `DSH_WORKSPACE`, `DSH_PORT` (default 3080), `DSH_AIRLOCK_
 Three layers of checks.
 
 - `dsh-airlock --selftest` runs about 40 probes inside the real box: reads of `~/.ssh`, `~/.aws`, Documents, Downloads, keychains, cloud storage and temp folders must fail; writes outside the workspace and to dsh's settings must fail; `open`, `osascript`, `security`, `screencapture`, the clipboard and other apps' preferences must fail; git, node and https must still work. Add your own paths, one per line, to `~/.dsh-airlock/selftest-probes`. A credentials file you care about is a good one.
-- `test/prove.sh` runs real agent turns with the network locked to your Mac, a fake model, a fake Brave API and a trap on every DeepSeek endpoint, while a hook inside dsh records every connection and DNS lookup it makes. It passes only if dsh talked to nothing but the local fakes, the trap saw nothing, the model requests carried no DeepSeek add-on fields, the agent's shell was confined, and search worked through the new plugin. It uses a throwaway home and workspace.
+- `test/prove.sh` runs real agent turns with the network locked to your Mac, a fake model, fake Brave and Tavily APIs and a trap on every DeepSeek endpoint, while a hook inside dsh records every connection and DNS lookup it makes. It passes only if dsh talked to nothing but the local fakes, the trap saw nothing, the model requests carried no DeepSeek add-on fields, the agent's shell was confined, and search worked through the new plugin with both Brave and Tavily. It uses a throwaway home and workspace.
 - `cd plugins/web-search && npm test` runs the search plugin's unit tests against local mock servers.
 
 ## Upgrading DSH

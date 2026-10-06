@@ -1,7 +1,7 @@
 {
   "name": "dsh-airlock-web-search",
   "version": "0.1.0",
-  "description": "Brave Search / SearXNG web search provider for DSH (DeepSeek Harness), used by dsh-airlock in place of the DeepSeek-only search provider",
+  "description": "Brave Search / Tavily / SearXNG web search provider for DSH (DeepSeek Harness), used by dsh-airlock in place of the DeepSeek-only search provider",
   "license": "Apache-2.0",
   "type": "module",
   "main": "index.js",

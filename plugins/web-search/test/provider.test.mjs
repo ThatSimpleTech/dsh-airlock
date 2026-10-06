@@ -19,9 +19,13 @@ const seen = [];
 let respond = () => ({ status: 200, body: {} });
 
 before(async () => {
-  server = http.createServer((req, res) => {
+  server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
-    seen.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), headers: req.headers });
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    let body;
+    try { body = raw ? JSON.parse(raw) : undefined; } catch { body = raw; }
+    seen.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), headers: req.headers, body });
     const out = respond(url, req);
     if (out.hang) return; // never answer: exercises the timeout path
     res.writeHead(out.status, { "content-type": "application/json" });
@@ -42,6 +46,8 @@ function provider(overrides = {}) {
       backend: "brave",
       braveApiKeyEnv: "BRAVE_SEARCH_API_KEY",
       braveBaseURL: `${base}/brave/res/v1`,
+      tavilyApiKeyEnv: "TAVILY_API_KEY",
+      tavilyBaseURL: `${base}/tavily`,
       searxngURL: undefined,
       timeoutMs: 2000,
       resolveApiKey: async () => "test-key",
@@ -123,6 +129,43 @@ test("brave: rejected key and rate limit produce hints", async () => {
   await assert.rejects(provider().search({ query: "x" }), /HTTP 429\. The plan's rate limit/);
 });
 
+test("tavily: posts the query with a bearer key and maps results", async () => {
+  seen.length = 0;
+  let posted;
+  respond = (url, req) => {
+    posted = req;
+    return {
+      status: 200,
+      body: {
+        query: "q",
+        results: [
+          { url: "https://example.net/t1", title: "Tavily <b>one</b>", content: "first &amp; only", score: 0.9, published_date: "2026-10-02" },
+          { url: "ftp://example.net/skip", title: "skip me", content: "" },
+        ],
+        response_time: 0.4,
+      },
+    };
+  };
+  const result = await provider({ backend: "tavily", resolveApiKey: async (ref) => (ref === "TAVILY_API_KEY" ? "tvly-test" : undefined) }).search({ query: "airlock", maxResults: 30 });
+  assert.equal(seen[0].path, "/tavily/search");
+  assert.equal(posted.method, "POST");
+  assert.equal(seen[0].headers.authorization, "Bearer tvly-test");
+  assert.deepEqual(seen[0].body, { query: "airlock", max_results: 20, search_depth: "basic", include_answer: false, include_raw_content: false });
+  assert.deepEqual(result.sources, [{ url: "https://example.net/t1", title: "Tavily one", snippet: "first & only", publishedAt: "2026-10-02" }]);
+});
+
+test("tavily: missing key, rejected key and spent credits explain themselves", async () => {
+  await assert.rejects(provider({ backend: "tavily", resolveApiKey: async () => undefined }).search({ query: "x" }), (error) => {
+    assert.equal(error.code, "WEB_PROVIDER_CREDENTIAL_MISSING");
+    assert.match(error.message, /dsh-airlock --set-key TAVILY_API_KEY/);
+    return true;
+  });
+  respond = () => ({ status: 401, body: { detail: "invalid key" } });
+  await assert.rejects(provider({ backend: "tavily" }).search({ query: "x" }), /HTTP 401\. The API key was rejected/);
+  respond = () => ({ status: 432, body: { detail: "limit" } });
+  await assert.rejects(provider({ backend: "tavily" }).search({ query: "x" }), /HTTP 432\. The plan's credit/);
+});
+
 test("searxng: requests json from the instance path and maps results", async () => {
   seen.length = 0;
   respond = () => ({
@@ -152,6 +195,19 @@ test("searxng: 403 explains the json format setting; missing url is unavailable"
   const p = provider({ backend: "searxng", searxngURL: undefined });
   assert.equal(p.available(), false);
   await assert.rejects(p.search({ query: "q" }), (error) => error.code === "WEB_PROVIDER_UNAVAILABLE");
+});
+
+test("an unreachable or blocked host names the host and how to switch backends", async () => {
+  const closed = http.createServer();
+  await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
+  const deadPort = closed.address().port;
+  await new Promise((resolve) => closed.close(resolve));
+  await assert.rejects(provider({ braveBaseURL: `http://127.0.0.1:${deadPort}/res/v1` }).search({ query: "x" }), (error) => {
+    assert.equal(error.code, "WEB_PROVIDER_ERROR");
+    assert.match(error.message, new RegExp(`could not reach 127\\.0\\.0\\.1:${deadPort} \\(ECONNREFUSED\\)`));
+    assert.match(error.message, /dsh-airlock --search/);
+    return true;
+  });
 });
 
 test("non-JSON success body is a provider error", async () => {

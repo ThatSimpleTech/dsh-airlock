@@ -1,10 +1,11 @@
 #!/bin/bash
 # dsh-airlock: run DSH (DeepSeek Harness) on macOS inside a kernel sandbox, with
-# every DeepSeek-facing plugin unmounted and a Brave/SearXNG web search instead.
+# every DeepSeek-facing plugin unmounted and a Brave, Tavily or SearXNG web search instead.
 #
 #   dsh-airlock                    start the web UI (settings and keys read-only)
 #   dsh-airlock --setup            start the web UI with settings writable (add model keys)
 #   dsh-airlock --search brave     use Brave Search (default; needs BRAVE_SEARCH_API_KEY)
+#   dsh-airlock --search tavily    use Tavily (needs TAVILY_API_KEY)
 #   dsh-airlock --search searxng URL   use a SearXNG server instead
 #   dsh-airlock --search off       no web search (web fetch still works)
 #   dsh-airlock --set-key NAME     store a secret such as BRAVE_SEARCH_API_KEY (prompts)
@@ -52,7 +53,7 @@ case "${1:-}" in
   --selftest) mode="selftest" ;;
   --run) mode="run"; shift; run_args=("$@"); [ "${#run_args[@]}" -gt 0 ] || die "--run needs dsh arguments" ;;
   --set-key) mode="set-key"; [ "$#" -eq 2 ] || die "usage: dsh-airlock --set-key NAME" ;;
-  --search) mode="search"; [ "$#" -ge 2 ] || die "usage: dsh-airlock --search brave|searxng URL|off" ;;
+  --search) mode="search"; [ "$#" -ge 2 ] || die "usage: dsh-airlock --search brave|tavily|searxng URL|off" ;;
   --version) echo "dsh-airlock $AIRLOCK_VERSION"; exit 0 ;;
   -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) die "unknown option: $1 (see --help)" ;;
@@ -79,12 +80,13 @@ valid_url() { local pattern='^https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'; [[ "$
 if [ "$mode" = "search" ]; then
   case "$2" in
     brave) [ "$#" -eq 2 ] || die "usage: dsh-airlock --search brave"; conf_set SEARCH_BACKEND brave ;;
+    tavily) [ "$#" -eq 2 ] || die "usage: dsh-airlock --search tavily"; conf_set SEARCH_BACKEND tavily ;;
     off) [ "$#" -eq 2 ] || die "usage: dsh-airlock --search off"; conf_set SEARCH_BACKEND off ;;
     searxng)
       [ "$#" -eq 3 ] || die "usage: dsh-airlock --search searxng URL"
       valid_url "$3" || die "not a plain http(s) URL: $3"
       conf_set SEARXNG_URL "$3"; conf_set SEARCH_BACKEND searxng ;;
-    *) die "unknown search backend: $2 (brave, searxng or off)" ;;
+    *) die "unknown search backend: $2 (brave, tavily, searxng or off)" ;;
   esac
   echo "dsh-airlock: web search set to $2. Restart dsh-airlock for it to take effect."
   exit 0
@@ -159,8 +161,9 @@ fi
 backend="$(conf_get SEARCH_BACKEND)"; backend="${backend:-brave}"
 searxng_url="$(conf_get SEARXNG_URL)"
 brave_base="$(conf_get BRAVE_BASE_URL)"
-for u in "$searxng_url" "$brave_base"; do [ -z "$u" ] || valid_url "$u" || die "bad URL in $CONF: $u"; done
-case "$backend" in brave|searxng|off) ;; *) die "bad SEARCH_BACKEND in $CONF: $backend" ;; esac
+tavily_base="$(conf_get TAVILY_BASE_URL)"
+for u in "$searxng_url" "$brave_base" "$tavily_base"; do [ -z "$u" ] || valid_url "$u" || die "bad URL in $CONF: $u"; done
+case "$backend" in brave|tavily|searxng|off) ;; *) die "bad SEARCH_BACKEND in $CONF: $backend" ;; esac
 
 # The launcher-owned top patch layer. It ranks above the profile patch the web
 # UI writes, so these rows win over anything saved in Settings.
@@ -228,6 +231,7 @@ if [ "$backend" != "off" ]; then
   echo "        backend: $backend"
   [ -z "$searxng_url" ] || echo "        searxngURL: '$searxng_url'"
   [ -z "$brave_base" ] || echo "        braveBaseURL: '$brave_base'"
+  [ -z "$tavily_base" ] || echo "        tavilyBaseURL: '$tavily_base'"
 fi
 } > "$R_BOX/.dsh/cordis.patch.yml"
 
